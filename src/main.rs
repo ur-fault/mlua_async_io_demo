@@ -10,10 +10,13 @@ fn main() {
 
     let (send, recv) = channel();
 
+    type Callback = Box<dyn FnOnce(&Lua) -> mlua::Result<()> + Send>;
+    type IoThead = thread::JoinHandle<Result<(), mlua::Error>>;
+
     #[derive(Clone)]
     struct EventLoop {
-        send: std::sync::mpsc::Sender<Box<dyn FnOnce(&Lua) -> mlua::Result<()> + Send>>,
-        threads: Arc<Mutex<Vec<thread::JoinHandle<Result<(), mlua::Error>>>>>,
+        send: std::sync::mpsc::Sender<Callback>,
+        threads: Arc<Mutex<Vec<IoThead>>>,
     }
 
     impl UserData for EventLoop {}
@@ -58,21 +61,6 @@ fn main() {
         })
         .unwrap();
 
-    // let print = lua
-    //     .create_function(|l, msg: MultiValue| {
-    //         stdout().write_all("Custom print: ".as_bytes())?;
-    //         for v in msg {
-    //             let s = l
-    //                 .coerce_string(v)?
-    //                 .ok_or_else(|| Error::external("cannot coerce string"))?;
-    //             stdout().write_all(&*s.as_bytes())?;
-    //         }
-    //         stdout().write_all("\n".as_bytes())?;
-    //         stdout().flush()?;
-    //         Ok(())
-    //     })
-    //     .unwrap();
-
     lua.globals()
         .set("read_file_async", read_file_async)
         .unwrap();
@@ -88,13 +76,6 @@ fn main() {
     "#;
 
     lua.load(lua_code).exec().unwrap();
-
-    // lua.globals()
-    //     .for_each::<String, Value>(|k, v| {
-    //         println!("{} = {:?}", k, v);
-    //         Ok(())
-    //     })
-    //     .unwrap();
 
     // main game loop
     loop {
