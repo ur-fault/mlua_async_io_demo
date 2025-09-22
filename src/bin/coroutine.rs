@@ -1,19 +1,15 @@
 use std::{sync::mpsc::channel, thread};
 
-use mlua::{FromLua, Function, IntoLuaMulti, Lua, MultiValue, Thread, UserData};
+use mlua::{FromLua, Function, Lua, Thread, UserData};
 
 fn main() {
     let lua = Lua::new();
 
     let (send, recv) = channel();
 
-    // type Callback = Box<dyn FnOnce(&Lua) -> mlua::Result<()> + Send>;
-    type IoThead = thread::JoinHandle<Result<(), mlua::Error>>;
-
     #[derive(Clone)]
     struct EventLoop {
         to_wake: std::sync::mpsc::Sender<Thread>,
-        // threads: Arc<Mutex<Vec<IoThead>>>,
     }
 
     impl UserData for EventLoop {}
@@ -24,10 +20,7 @@ fn main() {
         }
     }
 
-    let ev = EventLoop {
-        to_wake: send,
-        // threads: Arc::default(),
-    };
+    let ev = EventLoop { to_wake: send };
 
     lua.set_named_registry_value("ev", ev.clone()).unwrap();
 
@@ -35,15 +28,11 @@ fn main() {
         .create_async_function(async move |l, path: String| {
             let ev = l.named_registry_value::<EventLoop>("ev").unwrap();
             let current_thread = l.current_thread();
-            let l1 = l.clone();
-
             println!("1");
 
             let handle = thread::spawn(move || -> Result<_, mlua::Error> {
                 let s = std::fs::read_to_string(&path).map_err(mlua::Error::external)?;
-                ev.to_wake
-                    .send(current_thread)
-                    .unwrap();
+                ev.to_wake.send(current_thread).unwrap();
                 Ok(s)
             });
 
@@ -91,20 +80,9 @@ fn main() {
 
     // main game loop
     loop {
-        // process all callbacks
         while let Ok(to_wake) = recv.try_recv() {
             let _: () = to_wake.resume(()).unwrap();
         }
-
-        // let mut lock = ev.threads.lock().unwrap();
-        // for i in (0..lock.len()).rev() {
-        //     println!("Checking thread {}", i);
-        //     if lock[i].is_finished() {
-        //         let th = lock.remove(i);
-        //         th.join().unwrap().unwrap();
-        //     }
-        // }
-        // drop(lock);
 
         // simulate frame time
         std::thread::sleep(std::time::Duration::from_millis(16));
