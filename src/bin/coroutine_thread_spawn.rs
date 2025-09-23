@@ -81,7 +81,7 @@ fn main() {
             print(content)
         end)
 
-        for i = 1, 10 do
+        for i = 1, 1000 do
             async(function()
                 print("Hello from coroutine " .. i)
                 sleep(1.0)
@@ -103,8 +103,8 @@ fn main() {
     }
 }
 
-async fn wrap_blocking<'a, T: Send + 'static>(
-    ev: &'a EventLoop,
+async fn wrap_blocking<T: Send + 'static>(
+    ev: &EventLoop,
     current_thread: Thread,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> T {

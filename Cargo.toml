@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 mlua = { version = "0.11.3", features = ["vendored", "lua51", "anyhow", "send", "async"] }
 anyhow = "1.0"
+threadpool = "1.8.1"
