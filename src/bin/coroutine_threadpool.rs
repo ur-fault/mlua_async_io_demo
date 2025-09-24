@@ -12,7 +12,7 @@ use threadpool::ThreadPool;
 
 #[derive(Clone)]
 struct EventLoop {
-    send: mpsc::Sender<LuaThread>,
+    to_wake: mpsc::Sender<LuaThread>,
     thread_pool: ThreadPool,
     timers: Arc<Mutex<TimerManager>>,
 }
@@ -22,7 +22,7 @@ impl EventLoop {
         let (send, recv) = channel();
         (
             Self {
-                send,
+                to_wake: send,
                 thread_pool: ThreadPool::with_name("eventloop threadpool".into(), 128),
                 timers: Arc::new(Mutex::new(TimerManager::new())),
             },
@@ -79,11 +79,33 @@ fn main() -> anyhow::Result<()> {
     let ev2 = ev.clone();
     lua.set_named_registry_value("ev", ev2)?;
 
-    let spawn_async = lua.create_function(|l, f: Function| -> Result<(), mlua::Error> {
-        let thread = l.create_thread(f)?;
-        let _: () = thread.resume(())?;
-        Ok(())
-    })?;
+    struct Async;
+
+    impl UserData for Async {
+        fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+            methods.add_meta_method("__call", move |l, _, f: Function| {
+                let thread = l.create_thread(f)?;
+                thread.resume::<()>(())?;
+                Ok(thread)
+            });
+
+            methods.add_async_function(
+                "all",
+                async move |l, threads: mlua::Variadic<LuaThread>| {
+                    println!("Waiting for {} threads to complete", threads.len());
+                    let ev = l.named_registry_value::<EventLoop>("ev")?;
+                    let current_thread = l.current_thread();
+                    for thread in threads {
+                        while matches!(thread.status(), mlua::ThreadStatus::Resumable) {
+                            ev.to_wake.send(current_thread.clone()).unwrap();
+                            l.yield_with::<()>(()).await?;
+                        }
+                    }
+                    Ok(())
+                },
+            );
+        }
+    }
 
     let read_file_async = lua.create_async_function(async move |l, path: String| {
         let s: String = wrap_blocking(&l, move || {
@@ -111,38 +133,47 @@ fn main() -> anyhow::Result<()> {
         Ok(())
     })?;
 
-    lua.globals().set("async", spawn_async)?;
     lua.globals().set("read_file_async", read_file_async)?;
     lua.globals().set("exit_game", exit_game)?;
+    lua.globals().set("async", lua.create_userdata(Async)?)?;
     lua.globals().set("sleep", sleep)?;
-    // lua.globals().set("print", print)?;
 
     let lua_code = r#"
-        for i = 1, 1000 do
-            async(function()
+        threads = {}
+        for i = 1, 10 do
+            table.insert(threads, async(function()
                 print("Hello from coroutine " .. i)
                 sleep(1)
                 print("Coroutine " .. i .. " woke up after 1 second")
-            end)
+            end))
         end
+        async(function()
+            async.all(unpack(threads))
+            print("All coroutines have completed")
+        end)
     "#;
 
     lua.load(lua_code).exec()?;
 
+    let mut wake_in_frame = vec![];
+
     // main game loop
     loop {
         // poll timers
-
         ev.timers.lock().unwrap().poll_timers(|to_wake| {
-            ev.send.send(to_wake).unwrap();
+            ev.to_wake.send(to_wake).unwrap();
         });
 
         while let Ok(to_wake) = recv.try_recv() {
+            wake_in_frame.push(to_wake);
+        }
+
+        for to_wake in wake_in_frame.drain(..) {
             to_wake.resume::<()>(())?;
         }
 
         // simulate frame time
-        std::thread::sleep(std::time::Duration::from_millis(16));
+        std::thread::sleep(std::time::Duration::from_secs_f32(0.1f32));
     }
 }
 
@@ -157,7 +188,7 @@ async fn wrap_blocking<T: Send + 'static>(
     ev.thread_pool.execute(move || {
         let result = f();
         tx.send(result).unwrap();
-        ev.send.send(current_thread).unwrap();
+        ev.to_wake.send(current_thread).unwrap();
     });
 
     let result = loop {
