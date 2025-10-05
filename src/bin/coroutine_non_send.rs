@@ -8,10 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mlua::{
-    FromLua, FromLuaMulti, Function, IntoLuaMulti, Lua, Table, Thread as LuaThread, UserData,
-    Value, Variadic,
-};
+use mlua::{FromLua, Function, Lua, Table, Thread as LuaThread, UserData, Variadic};
 use threadpool::ThreadPool;
 
 #[derive(Clone)]
@@ -19,6 +16,7 @@ struct EventLoop {
     to_wake: mpsc::Sender<LuaThread>,
     thread_pool: ThreadPool,
     timers: Arc<Mutex<TimerManager>>,
+    run_registry: Arc<Mutex<RunRegistry>>,
 }
 
 impl EventLoop {
@@ -28,6 +26,7 @@ impl EventLoop {
             to_wake: send,
             thread_pool: ThreadPool::with_name("eventloop threadpool".into(), 128),
             timers: Arc::new(Mutex::new(TimerManager::new())),
+            run_registry: Arc::new(Mutex::new(RunRegistry::new().0)),
         };
 
         (event_loop, recv)
@@ -46,12 +45,12 @@ type Id = u32;
 
 struct RunRegistry {
     next_id: Id,
-    functions: BTreeMap<Id, LuaRunnable>,
-    channel: mpsc::Receiver<Id>,
+    functions: BTreeMap<Id, Function>,
+    channel: mpsc::Receiver<RunCommand>,
 }
 
 impl RunRegistry {
-    fn new() -> (Self, mpsc::Sender<Id>) {
+    fn new() -> (Self, mpsc::Sender<RunCommand>) {
         let (send, recv) = mpsc::channel();
         (
             Self {
@@ -63,11 +62,19 @@ impl RunRegistry {
         )
     }
 
-    fn register(&mut self, f: LuaRunnable) -> Id {
+    fn register_fn(&mut self, f: Function) -> Id {
         let id = self.next_id;
         self.next_id += 1;
         self.functions.insert(id, f);
         id
+    }
+
+    fn register_thread(&mut self, l: &Lua, thread: LuaThread) -> mlua::Result<Id> {
+        let f = l.create_function(move |_, ()| {
+            thread.resume::<()>(())?;
+            Ok(())
+        })?;
+        Ok(self.register_fn(f))
     }
 }
 
@@ -91,6 +98,10 @@ impl Drop for RunHandle {
     fn drop(&mut self) {
         let _ = self.registry.send(RunCommand::Drop(self.id));
     }
+}
+
+trait AsLua: Send {
+    fn as_lua(self: Box<Self>, l: &Lua) -> mlua::Result<mlua::Value>;
 }
 
 #[derive(Clone)]
@@ -122,36 +133,40 @@ impl UserData for CancelationToken {
 
 struct RepeatTimer {
     interval: Duration,
-    function: LuaRunnable,
+    function: Function,
     immediate: bool,
     remaining: Option<u32>,
 }
 
 struct TimerManager {
-    timers: BTreeMap<Instant, (LuaThread, CancelationToken)>,
-    repeat: BTreeMap<Instant, InnerRepeatTimer>,
+    timers: BTreeMap<Instant, InnerTimer>,
 }
 
-struct InnerRepeatTimer {
+struct Repeating {
     interval: Duration,
-    function: LuaRunnable,
+    function: Function,
     remaining: Option<u32>,
     ran: u32,
-    notify: Box<dyn FnOnce() + Send + 'static>,
+    notify_on_end: Box<dyn FnOnce() + Send + 'static>,
     token: CancelationToken,
+}
+
+enum InnerTimer {
+    Oneshot(LuaThread, CancelationToken),
+    Repeating(Repeating),
 }
 
 impl TimerManager {
     fn new() -> Self {
         Self {
             timers: BTreeMap::new(),
-            repeat: BTreeMap::new(),
         }
     }
 
     fn add_timer(&mut self, when: Instant, thread: LuaThread) -> CancelationToken {
         let token = CancelationToken::new();
-        self.timers.insert(when, (thread, token.clone()));
+        self.timers
+            .insert(when, InnerTimer::Oneshot(thread, token.clone()));
         token
     }
 
@@ -173,22 +188,22 @@ impl TimerManager {
 
         let token = CancelationToken::new();
 
-        self.repeat.insert(
+        self.timers.insert(
             when,
-            InnerRepeatTimer {
+            InnerTimer::Repeating(Repeating {
                 interval,
                 function,
                 remaining,
                 ran: 0,
-                notify: Box::new(notify_end),
+                notify_on_end: Box::new(notify_end),
                 token: token.clone(),
-            },
+            }),
         );
 
         token
     }
 
-    fn poll_timers(&mut self, mut f: impl FnMut(LuaRunnable)) {
+    fn poll_timers(&mut self, mut f: impl FnMut(&InnerTimer)) {
         let now = Instant::now();
 
         loop {
@@ -200,106 +215,49 @@ impl TimerManager {
                 break;
             }
 
-            let (_, (thread, token)) = self.timers.pop_first().unwrap();
-            if !token.is_canceled() {
-                f(thread.into());
-            }
-        }
-
-        loop {
-            let Some(entry) = self.repeat.first_entry() else {
-                break;
-            };
-
-            if *entry.key() > now {
-                break;
-            }
-
             let next = *entry.key();
-            let mut timer = entry.remove();
-            if timer.token.is_canceled() {
-                (timer.notify)();
-                continue;
-            }
-
-            if let Some(remaining) = &mut timer.remaining {
-                if *remaining == 1 {
-                    timer.ran += 1;
-                    let _ = timer.function.run::<()>(timer.ran);
-                    (timer.notify)();
-                    continue;
+            match entry.remove() {
+                InnerTimer::Oneshot(thread, token) => {
+                    if !token.is_canceled() {
+                        f(&InnerTimer::Oneshot(thread, token));
+                    }
                 }
-                *remaining -= 1;
+                InnerTimer::Repeating(mut repeating) => {
+                    if repeating.token.is_canceled() {
+                        (repeating.notify_on_end)();
+                        continue;
+                    }
+
+                    if let Some(remaining) = &mut repeating.remaining {
+                        if *remaining == 1 {
+                            repeating.ran += 1;
+
+                            let timer = InnerTimer::Repeating(repeating);
+
+                            f(&timer);
+
+                            match timer {
+                                InnerTimer::Repeating(r) => repeating = r,
+                                _ => unreachable!(),
+                            }
+
+                            (repeating.notify_on_end)();
+                            continue;
+                        }
+                        *remaining -= 1;
+                    }
+
+                    // since `ran` starts at 0, we increment before calling to be consistent with lua's
+                    // 1-based indexing
+                    repeating.ran += 1;
+
+                    let next_time = next + repeating.interval; // before for borrow checker
+                    let timer = InnerTimer::Repeating(repeating);
+
+                    f(&timer);
+                    self.timers.insert(next_time, timer);
+                }
             }
-
-            // since `ran` starts at 0, we increment before calling to be consistent with lua's
-            // 1-based indexing
-            timer.ran += 1;
-            if let Err(e) = timer.function.run::<()>((timer.ran, timer.token.clone())) {
-                eprintln!("Error in repeating timer: {e}");
-                (timer.notify)();
-                continue;
-            }
-
-            let next_time = next + timer.interval;
-            self.repeat.insert(next_time, timer);
-        }
-    }
-}
-
-#[derive(Clone)]
-enum LuaRunnable {
-    Thread(LuaThread),
-    Function(Function),
-}
-
-impl LuaRunnable {
-    fn run<T: FromLuaMulti>(&self, args: impl IntoLuaMulti) -> mlua::Result<T> {
-        Ok(match self {
-            LuaRunnable::Thread(t) => t.resume(args)?,
-            LuaRunnable::Function(f) => f.call(args)?,
-        })
-    }
-
-    /// Returns `true` if the lua runnable is [`Function`].
-    ///
-    /// [`Function`]: LuaRunnable::Function
-    #[must_use]
-    fn is_function(&self) -> bool {
-        matches!(self, Self::Function(..))
-    }
-
-    /// Returns `true` if the lua runnable is [`Thread`].
-    ///
-    /// [`Thread`]: LuaRunnable::Thread
-    #[must_use]
-    fn is_thread(&self) -> bool {
-        matches!(self, Self::Thread(..))
-    }
-}
-
-impl From<LuaThread> for LuaRunnable {
-    fn from(t: LuaThread) -> Self {
-        Self::Thread(t)
-    }
-}
-
-impl From<Function> for LuaRunnable {
-    fn from(f: Function) -> Self {
-        Self::Function(f)
-    }
-}
-
-impl FromLua for LuaRunnable {
-    fn from_lua(value: mlua::Value, _: &Lua) -> mlua::Result<Self> {
-        match value {
-            Value::Thread(t) => Ok(LuaRunnable::Thread(t)),
-            Value::Function(f) => Ok(LuaRunnable::Function(f)),
-            _ => Err(mlua::Error::FromLuaConversionError {
-                from: value.type_name(),
-                to: String::from("thread or function"),
-                message: Some("expected thread or function".into()),
-            }),
         }
     }
 }
@@ -433,7 +391,19 @@ fn main() -> anyhow::Result<()> {
     loop {
         // poll timers
         println!("Polling timers...");
-        ev.timers.lock().unwrap().poll_timers();
+        ev.timers.lock().unwrap().poll_timers(|r| {
+            match r {
+                InnerTimer::Oneshot(f, _) => {
+                    wake_in_frame.push(f.clone());
+                }
+                InnerTimer::Repeating(Repeating {
+                    function,
+                    ran,
+                    token,
+                    ..
+                }) => function.call((*ran, token.clone())).unwrap(),
+            };
+        });
 
         while let Ok(to_wake) = recv.try_recv() {
             wake_in_frame.push(to_wake);
@@ -457,9 +427,14 @@ async fn wrap_blocking<T: Send + 'static>(
 
     let (tx, rx) = channel();
     ev.thread_pool.execute(move || {
+        // let result = f();
+        // tx.send(result).unwrap();
+        // ev.to_wake.send(current_thread).unwrap();
+
+
         let result = f();
         tx.send(result).unwrap();
-        ev.to_wake.send(current_thread).unwrap();
+        ev.to_wake.send
     });
 
     let result = loop {
