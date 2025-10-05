@@ -11,6 +11,18 @@ use std::{
 use mlua::{FromLua, Function, Lua, Table, Thread as LuaThread, UserData, Variadic};
 use threadpool::ThreadPool;
 
+macro_rules! warn_on_err {
+    ($expr:expr) => {
+        match $expr {
+            std::result::Result::Err(err) => {
+                eprintln!("Warning: {}", err);
+                std::result::Result::Err(err)
+            }
+            ok => ok,
+        }
+    };
+}
+
 #[derive(Clone)]
 struct EventLoop {
     to_wake: mpsc::Sender<LuaThread>,
@@ -24,9 +36,9 @@ impl EventLoop {
         let (send, recv) = channel();
         let event_loop = Self {
             to_wake: send,
-            thread_pool: ThreadPool::with_name("eventloop threadpool".into(), 128),
+            thread_pool: ThreadPool::with_name("eventloop threadpool".into(), 16),
             timers: Arc::new(Mutex::new(TimerManager::new())),
-            run_registry: Arc::new(Mutex::new(RunRegistry::new().0)),
+            run_registry: Arc::new(Mutex::new(RunRegistry::new())),
         };
 
         (event_loop, recv)
@@ -46,30 +58,50 @@ type Id = u32;
 struct RunRegistry {
     next_id: Id,
     functions: BTreeMap<Id, Function>,
-    channel: mpsc::Receiver<RunCommand>,
+    commands: mpsc::Receiver<RunCommand>,
+    sender: mpsc::Sender<RunCommand>,
 }
 
 impl RunRegistry {
-    fn new() -> (Self, mpsc::Sender<RunCommand>) {
+    fn new() -> Self {
         let (send, recv) = mpsc::channel();
-        (
-            Self {
-                next_id: 0,
-                functions: BTreeMap::new(),
-                channel: recv,
-            },
-            send,
-        )
+        Self {
+            next_id: 0,
+            functions: BTreeMap::new(),
+            commands: recv,
+            sender: send,
+        }
     }
 
-    fn register_fn(&mut self, f: Function) -> Id {
+    fn tick(&mut self) {
+        while let Ok(cmd) = self.commands.try_recv() {
+            match cmd {
+                RunCommand::Wake(id) => {
+                    if let Some(f) = self.functions.remove(&id) {
+                        match f.call::<()>(()) {
+                            Ok(_) => {}
+                            Err(err) => eprintln!("Error in run registry function: {}", err),
+                        }
+                    }
+                }
+                RunCommand::Drop(id) => {
+                    self.functions.remove(&id);
+                }
+            }
+        }
+    }
+
+    fn register_fn(&mut self, f: Function) -> RunHandle {
         let id = self.next_id;
         self.next_id += 1;
         self.functions.insert(id, f);
-        id
+        RunHandle {
+            id,
+            registry: self.sender.clone(),
+        }
     }
 
-    fn register_thread(&mut self, l: &Lua, thread: LuaThread) -> mlua::Result<Id> {
+    fn _register_thread(&mut self, l: &Lua, thread: LuaThread) -> mlua::Result<RunHandle> {
         let f = l.create_function(move |_, ()| {
             thread.resume::<()>(())?;
             Ok(())
@@ -91,6 +123,7 @@ struct RunHandle {
 impl RunHandle {
     fn wake(self) {
         let _ = self.registry.send(RunCommand::Wake(self.id));
+        std::mem::forget(self);
     }
 }
 
@@ -98,10 +131,6 @@ impl Drop for RunHandle {
     fn drop(&mut self) {
         let _ = self.registry.send(RunCommand::Drop(self.id));
     }
-}
-
-trait AsLua: Send {
-    fn as_lua(self: Box<Self>, l: &Lua) -> mlua::Result<mlua::Value>;
 }
 
 #[derive(Clone)]
@@ -262,21 +291,27 @@ impl TimerManager {
     }
 }
 
-struct Async;
+struct Async(EventLoop);
 
 impl UserData for Async {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_method("__call", move |l, _, f: Function| {
+        methods.add_meta_method("__call", |l, _, f: Function| {
             let thread = l.create_thread(f)?;
             thread.resume::<()>(())?;
             Ok(thread)
         });
 
-        methods.add_async_function("all", async move |l, threads: Variadic<LuaThread>| {
+        methods.add_async_method("all", async |l, a, threads: Variadic<LuaThread>| {
             let ev = get_ev(&l)?;
             let current_thread = l.current_thread();
             for thread in threads {
+                if thread.status() == mlua::ThreadStatus::Running {
+                    return Err(mlua::Error::RuntimeError(
+                        "Cannot wait on a running thread".into(),
+                    ));
+                }
                 while matches!(thread.status(), mlua::ThreadStatus::Resumable) {
+                    // Fucking horrible implementation, wakes on every frame
                     ev.to_wake.send(current_thread.clone()).unwrap();
                     l.yield_with::<()>(()).await?;
                 }
@@ -291,16 +326,18 @@ fn main() -> anyhow::Result<()> {
 
     let (ev, recv) = EventLoop::new();
 
-    let ev2 = ev.clone();
-    lua.set_named_registry_value("ev", ev2)?;
+    let ev_ = ev.clone();
+    lua.set_named_registry_value("ev", ev_)?; // would be better to avoid this, but global 
 
-    let read_file_async = lua.create_async_function(async move |l, path: String| {
-        let s = wrap_blocking(&l, move || {
-            std::fs::read_to_string(&path).map_err(mlua::Error::external)
-        })
-        .await??;
-
-        Ok(s)
+    let ev_ = ev.clone();
+    let read_file_async = lua.create_async_function(move |l, path: String| {
+        let ev = ev_.clone();
+        async move {
+            Ok(wrap_blocking(ev, &l, move || {
+                std::fs::read_to_string(&path).map_err(mlua::Error::external)
+            })
+            .await?)
+        }
     })?;
 
     let exit_game = lua.create_function(|_, code: i32| -> Result<(), mlua::Error> {
@@ -308,79 +345,107 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(code);
     })?;
 
-    let sleep = lua.create_async_function(async move |l, s: f32| {
-        let ev = get_ev(&l)?;
-        let thread = l.current_thread();
-        let resume_at = Instant::now() + Duration::from_secs_f32(s);
-        println!("a");
-        ev.timers.lock().unwrap().add_timer(resume_at, thread);
+    let ev_ = ev.clone();
+    let sleep = lua.create_async_function(move |l, s: f32| {
+        let ev = ev_.clone();
 
-        let mut warn = false;
+        async move {
+            let thread = l.current_thread();
+            let resume_at = Instant::now() + Duration::from_secs_f32(s);
+            ev.timers.lock().unwrap().add_timer(resume_at, thread);
 
-        while Instant::now() < resume_at {
-            if warn {
-                println!("Warning: sleep() thread woken up early");
+            let mut warn = false;
+
+            while Instant::now() < resume_at {
+                if warn {
+                    println!("Warning: sleep() thread woken up early");
+                }
+                l.yield_with::<()>(()).await?;
+                warn = true;
             }
-            l.yield_with::<()>(()).await?;
-            warn = true;
-        }
 
-        Ok(())
+            Ok(())
+        }
     })?;
 
-    let repeat_every = lua
-        .create_async_function(|l, (f, interval, options)| repeat_every(l, f, interval, options))?;
+    let ev_ = ev.clone();
+    let bad_sleep = lua.create_async_function(move |l, _: ()| {
+        let ev = ev_.clone();
+        async move {
+            Ok(wrap_blocking(ev, &l, move || {
+                std::thread::sleep(Duration::from_secs_f32(0.01));
+            })
+            .await?)
+        }
+    })?;
+
+    let ev_ = ev.clone();
+    let repeat_every = lua.create_async_function(move |l, (f, interval, options)| {
+        let ev = ev_.clone();
+        async move { repeat_every(ev, l, f, interval, options).await }
+    })?;
 
     lua.globals().set("read_file_async", read_file_async)?;
     lua.globals().set("exit_game", exit_game)?;
-    lua.globals().set("async", lua.create_userdata(Async)?)?;
     lua.globals().set("sleep", sleep)?;
+    lua.globals().set("bad_sleep", bad_sleep)?;
     lua.globals().set("repeatEvery", repeat_every)?;
 
-    // let lua_code = r#"
-    //     threads = {}
-    //     for i = 1, 10 do
-    //         table.insert(threads, async(function()
-    //             print("Hello from coroutine " .. i)
-    //             sleep(1)
-    //             print("Coroutine " .. i .. " woke up after 1 second")
-    //         end))
-    //     end
-    //     async(function()
-    //         async.all(unpack(threads))
-    //         print("All coroutines have completed")
-    //         exit_game(0)
-    //     end)
-    // "#;
-
-    // let lua_code = r#"
-    //     local flag = repeatEvery(function(i) print(i) end, 1.0)
-    //     repeatEvery(function() print("aaaaaaa") end, 1.0)
-    //     async(function()
-    //         local interval = 0.5
-    //         repeatEvery(function(i)
-    //             print("Repeating every " .. interval .. " seconds, now at " .. i .. " iterations")
-    //         end, interval, { immediate = false, max_count = 5, wait = true })
-    //         sleep(2.0)
-    //         flag:cancel()
-    //         print("aa2")
-    //         sleep(2.0)
-    //         print("aa2")
-    //         exit_game(0)
-    //         -- exit_game(0)
-    //     end)
-    // "#;
+    let ev_ = ev.clone();
+    lua.preload_module(
+        "async",
+        lua.create_function(move |l, _: ()| l.create_userdata(Async(ev_.clone())))?,
+    )?;
 
     let lua_code = r#"
-        async(function()
-            print("1")
-            sleep(1.0)
-            print("2")
-            sleep(1.0)
-            print("3")
-            sleep(1.0)
-            print("4")
-        end)
+        local async = require("async")
+
+        -- threads = {}
+        -- for i = 1, 3 do
+        --     threads[i] = async(function()
+        --         print("Thread " .. i .. " starting")
+        --         local content = read_file_async("test.txt")
+        --         print(type(content))
+        --         -- local ok, len = pcall(function() return #content end)
+        --         local ok, len = true, #content
+        --         print("Thread " .. i .. " read file with length " .. (ok and len or "error: " .. len))
+        --         sleep(1.0)
+        --         print("Thread " .. i .. " finished after sleep")
+        --     end)
+        -- end
+        -- 
+        -- async(function()
+        --     async:all(unpack(threads))
+        --     exit_game(0)
+        -- end)
+
+        local fn = function()
+            -- local content = read_file_async("test.txt")
+            -- local len = #content
+            bad_sleep(0.1)
+            local len = #nil
+        end
+
+        threads = { async(fn), async(fn) }
+
+        -- async(function()
+        --     print("A")
+        --     sleep(1.0)
+        --     print("B")
+        --     sleep(1.0)
+        --     print("C")
+        --     sleep(1.0)
+        --     print("D")
+        --     exit_game(0)
+        -- end)
+        --
+        -- repeatEvery(function(i, token)
+        --     print("tick " .. i)
+        --     if i >= 5 then 
+        --         print("canceling")
+        --         token:cancel()
+        --     end
+        -- end, 0.5, { immediate = true })
     "#;
 
     lua.load(lua_code).exec()?;
@@ -389,8 +454,11 @@ fn main() -> anyhow::Result<()> {
 
     // main game loop
     loop {
+        // tick run registry
+        ev.run_registry.lock().unwrap().tick();
+
         // poll timers
-        println!("Polling timers...");
+        // println!("Polling timers...");
         ev.timers.lock().unwrap().poll_timers(|r| {
             match r {
                 InnerTimer::Oneshot(f, _) => {
@@ -410,7 +478,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         for to_wake in wake_in_frame.drain(..) {
-            to_wake.resume::<()>(())?;
+            warn_on_err!(to_wake.resume::<()>(()));
         }
 
         // simulate frame time
@@ -419,22 +487,22 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn wrap_blocking<T: Send + 'static>(
+    ev: EventLoop,
     lua: &Lua,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> anyhow::Result<T> {
-    let ev = get_ev(lua)?;
     let current_thread = lua.current_thread();
+    let thread_id = ev
+        .run_registry
+        .lock()
+        .unwrap()
+        ._register_thread(lua, current_thread)?;
 
     let (tx, rx) = channel();
     ev.thread_pool.execute(move || {
-        // let result = f();
-        // tx.send(result).unwrap();
-        // ev.to_wake.send(current_thread).unwrap();
-
-
         let result = f();
-        tx.send(result).unwrap();
-        ev.to_wake.send
+        warn_on_err!(tx.send(result)).unwrap();
+        thread_id.wake();
     });
 
     let result = loop {
@@ -448,13 +516,12 @@ async fn wrap_blocking<T: Send + 'static>(
 }
 
 async fn repeat_every(
+    ev: EventLoop,
     l: Lua,
-    f: LuaRunnable,
+    f: Function,
     interval: f32,
     options: Option<Table>,
 ) -> Result<Option<CancelationToken>, mlua::Error> {
-    let ev = get_ev(&l)?;
-
     let (now, max_count, wait) = if let Some(opts) = options {
         let now = opts.get("immediate").unwrap_or(false);
         let count = opts.get("max_count").ok();
@@ -476,9 +543,14 @@ async fn repeat_every(
         }
 
         let current_thread = l.current_thread();
+        let handle = ev
+            .run_registry
+            .lock()
+            .unwrap()
+            ._register_thread(&l, current_thread)?;
         let (tx, rx) = sync_channel(1);
 
-        let to_wake = ev.to_wake.clone();
+        // let to_wake = ev.to_wake.clone();
         ev.timers.lock().unwrap().add_repeating_timer(
             RepeatTimer {
                 interval: Duration::from_secs_f32(interval),
@@ -487,8 +559,8 @@ async fn repeat_every(
                 remaining: max_count,
             },
             move || {
-                to_wake.send(current_thread).unwrap();
                 let _ = tx.send(());
+                handle.wake();
             },
         );
 
