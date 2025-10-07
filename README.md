@@ -21,7 +21,7 @@ So in this repo are various ways of implementing async
 
 I also found SEGFAULT in one of them, so I'm condensing the example into a minimal one that reproduces the issue.
 
-## Refernes
+## References
 
 - [mio](https://github.com/tokio-rs/mio#)
 - [libuv](https://libuv.org/)
